@@ -1,0 +1,39 @@
+name: Build and run test program
+description: >
+  Build test/minimal.vcxproj using wxWidgets set up by the main action and run
+  the resulting program. This is only used by this repository own workflow.
+
+inputs:
+  configuration:
+    required: true
+  platform:
+    required: true
+  toolset:
+    default: ''
+  cxx-standard:
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Set up MSBuild
+      uses: microsoft/setup-msbuild@v3
+
+    - name: Build test program
+      shell: pwsh
+      working-directory: ${{ github.workspace }}/test
+      env:
+        TEST_CONFIG: ${{ inputs.configuration }}
+        TEST_PLATFORM: ${{ inputs.platform }}
+        TEST_TOOLSET: ${{ inputs.toolset }}
+        TEST_CXX_STD: ${{ inputs.cxx-standard }}
+      run: |
+        $props = "Configuration=$env:TEST_CONFIG;Platform=$env:TEST_PLATFORM"
+        if ($env:TEST_TOOLSET) { $props += ";PlatformToolset=$env:TEST_TOOLSET" }
+        if ($env:TEST_CXX_STD) { $props += ";TestCxxStandard=$env:TEST_CXX_STD" }
+        msbuild -noLogo -verbosity:m "-property:$props" minimal.vcxproj
+
+    - name: Run test program
+      shell: pwsh
+      working-directory: ${{ github.workspace }}/test
+      run: ./build/${{ inputs.platform }}/${{ inputs.configuration }}/minimal.exe

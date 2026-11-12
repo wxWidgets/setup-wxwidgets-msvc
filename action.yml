@@ -1,0 +1,264 @@
+name: Set up wxWidgets for MSVC
+description: >
+  Build wxWidgets libraries with MSVC, caching them for the subsequent runs,
+  and set WXWIN for the projects using wxwidgets.props.
+author: wxWidgets
+branding:
+  icon: package
+  color: blue
+
+inputs:
+  ref:
+    description: >
+      wxWidgets commit SHA, tag or branch to build. Using a fixed SHA or tag is
+      strongly recommended: a branch name is resolved to its current tip
+      commit, so a new build is done whenever the branch changes.
+    required: true
+  repository:
+    description: GitHub repository to get wxWidgets from.
+    default: wxWidgets/wxWidgets
+  configuration:
+    description: wx_vc17.sln configuration to build, e.g. "Debug" or "Release".
+    default: Release
+  platform:
+    description: wx_vc17.sln platform to build, e.g. "x64" or "Win32".
+    default: x64
+  toolset:
+    description: >
+      MSVC platform toolset to use, e.g. "v143". By default, the toolset
+      corresponding to the latest installed Visual Studio version is used, but
+      this must be specified if the project using wxWidgets uses an older
+      toolset, as the libraries built by a newer one can't be linked with it.
+    default: ''
+  cxx-standard:
+    description: >
+      C++ standard to build wxWidgets with: "14", "17", "20" or "latest". By
+      default, the compiler default is used. This only affects wxWidgets
+      itself and not the projects using it.
+    default: ''
+  projects:
+    description: >
+      Semicolon-separated list of wx_vc17.sln projects (e.g. "core;html") to
+      build together with their dependencies. Everything is built if empty.
+    default: ''
+  submodules:
+    description: >
+      Space-separated list of wxWidgets submodules to check out, the default
+      one is enough to build everything except wxSTC (which also needs
+      src/stc/scintilla and src/stc/lexilla). The submodules which don't exist
+      in the version being built are silently skipped.
+    default: >-
+      src/zlib src/png src/jpeg src/tiff src/expat
+      3rdparty/pcre 3rdparty/nanosvg 3rdparty/lunasvg 3rdparty/libwebp
+  extra-paths:
+    description: >
+      Newline-separated list of paths (or glob patterns) relative to wxWidgets
+      directory to keep in addition to the default ones, e.g. the headers of
+      the third-party libraries bundled with wxWidgets.
+    default: ''
+  path:
+    description: >
+      Directory to put wxWidgets in, "wxWidgets" directory next to the
+      checkout of the current repository (i.e. outside of it) by default. It
+      must not exist or be empty.
+    default: ''
+  cache-version:
+    description: Change this to ignore all the previously cached builds.
+    default: '1'
+
+outputs:
+  wxwin:
+    description: Full path to wxWidgets directory, also available as WXWIN.
+    value: ${{ steps.setup.outputs.wxwin }}
+  cache-hit:
+    description: '"true" if wxWidgets was restored from the cache.'
+    value: ${{ steps.restore.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up wxWidgets build parameters
+      id: setup
+      shell: bash
+      env:
+        WX_REF: ${{ inputs.ref }}
+        WX_REPO: ${{ inputs.repository }}
+        WX_CONFIG: ${{ inputs.configuration }}
+        WX_PLATFORM: ${{ inputs.platform }}
+        WX_TOOLSET: ${{ inputs.toolset }}
+        WX_CXX_STD: ${{ inputs.cxx-standard }}
+        WX_PROJECTS: ${{ inputs.projects }}
+        WX_PATH: ${{ inputs.path }}
+        WX_CACHE_VERSION: ${{ inputs.cache-version }}
+        WX_EXTRA_PATHS: ${{ inputs.extra-paths }}
+        WX_RUNNER_WORKSPACE: ${{ runner.workspace }}
+      run: |
+        set -euo pipefail
+
+        if [[ "$RUNNER_OS" != Windows ]]; then
+          echo "::error::This action can only be used on Windows runners."
+          exit 1
+        fi
+
+        case "$WX_CXX_STD" in
+          ''|14|17|20|latest) ;;
+          *)
+            echo "::error::Unsupported C++ standard \"$WX_CXX_STD\"."
+            exit 1
+            ;;
+        esac
+
+        if [[ "$WX_REF" =~ ^[0-9a-f]{40}$ ]]; then
+          sha=$WX_REF
+        else
+          # For annotated tags, use the commit they point to, which is output
+          # as "refs/tags/xxx^{}" by ls-remote, rather than the tag itself.
+          refs=$(git ls-remote "https://github.com/$WX_REPO.git" "$WX_REF")
+          sha=$(echo "$refs" | grep -F '^{}' | cut -f1 || true)
+          if [[ -z "$sha" ]]; then
+            sha=$(echo "$refs" | head -n1 | cut -f1)
+          fi
+          if [[ -z "$sha" ]]; then
+            echo "::error::wxWidgets ref \"$WX_REF\" not found in $WX_REPO."
+            exit 1
+          fi
+          echo "wxWidgets $WX_REF resolved to $sha"
+        fi
+
+        # Note that runner.workspace is the parent of github.workspace, so the
+        # default directory is outside of the project checkout.
+        wxdir=$(cygpath -am "${WX_PATH:-$WX_RUNNER_WORKSPACE/wxWidgets}")
+
+        # The libraries depend on the compiler version, so include the Visual
+        # Studio version in the key to avoid reusing them if it changes, as
+        # happens when the runner image is updated to a new major version.
+        vswhere="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+        vsver=$("$vswhere" -latest -requires Microsoft.Component.MSBuild \
+                  -property installationVersion | cut -d. -f1)
+        if [[ -z "$vsver" ]]; then
+          echo "::error::Visual Studio with MSBuild not found."
+          exit 1
+        fi
+        echo "Using Visual Studio $vsver with ${WX_TOOLSET:-default} toolset"
+
+        projects=${WX_PROJECTS:-all}
+        key="wx-msvc-v$WX_CACHE_VERSION-${RUNNER_OS}-${RUNNER_ARCH}-${WX_REPO/\//-}-$sha"
+        key="$key-vs$vsver-${WX_TOOLSET:-default}-cxx${WX_CXX_STD:-default}"
+        key="$key-$WX_PLATFORM-${WX_CONFIG// /_}-${projects//;/+}"
+
+        # The extra paths affect what is cached, so they must be in the key.
+        if [[ -n "$WX_EXTRA_PATHS" ]]; then
+          key="$key-$(echo "$WX_EXTRA_PATHS" | sha1sum | cut -c1-8)"
+        fi
+
+        {
+          echo "sha=$sha"
+          echo "wxwin=$(cygpath -w "$wxdir")"
+          echo "wxdir=$wxdir"
+          echo "key=$key"
+          echo "paths<<EOF_PATHS"
+          for p in include lib wxwidgets.props 'build/msw/*.props' misc/msvc; do
+            echo "$wxdir/$p"
+          done
+          while read -r p; do
+            if [[ -n "$p" ]]; then
+              echo "$wxdir/$p"
+            fi
+          done <<< "$WX_EXTRA_PATHS"
+          echo "EOF_PATHS"
+        } >> "$GITHUB_OUTPUT"
+
+        echo "WXWIN=$(cygpath -w "$wxdir")" >> "$GITHUB_ENV"
+
+    - name: Restore wxWidgets from cache
+      id: restore
+      uses: actions/cache/restore@v6
+      with:
+        key: ${{ steps.setup.outputs.key }}
+        path: ${{ steps.setup.outputs.paths }}
+
+    - name: Check out wxWidgets
+      if: steps.restore.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        WX_SHA: ${{ steps.setup.outputs.sha }}
+        WX_REPO: ${{ inputs.repository }}
+        WX_DIR: ${{ steps.setup.outputs.wxdir }}
+        WX_SUBMODULES: ${{ inputs.submodules }}
+      run: |
+        set -euo pipefail
+
+        if [[ -d "$WX_DIR" && -n "$(ls -A "$WX_DIR")" ]]; then
+          echo "::error::Directory $WX_DIR already exists and is not empty."
+          exit 1
+        fi
+
+        git init -q "$WX_DIR"
+        cd "$WX_DIR"
+        git remote add origin "https://github.com/$WX_REPO.git"
+        git fetch -q --depth=1 origin "$WX_SHA"
+        git checkout -q FETCH_HEAD
+
+        # Only use the submodules existing in this version, e.g. 3.2 doesn't
+        # have some of the ones used by the later versions.
+        available=$(git config -f .gitmodules --get-regexp '\.path$' | cut -d' ' -f2)
+        submodules=()
+        for s in $WX_SUBMODULES; do
+          if grep -qxF "$s" <<< "$available"; then
+            submodules+=("$s")
+          else
+            echo "Skipping submodule $s not present in this version."
+          fi
+        done
+
+        if [[ ${#submodules[@]} -gt 0 ]]; then
+          git submodule update -q --init --depth=1 --jobs=4 -- "${submodules[@]}"
+        fi
+
+    - name: Set up MSBuild
+      if: steps.restore.outputs.cache-hit != 'true'
+      uses: microsoft/setup-msbuild@v3
+
+    - name: Build wxWidgets
+      if: steps.restore.outputs.cache-hit != 'true'
+      shell: pwsh
+      working-directory: ${{ steps.setup.outputs.wxdir }}/build/msw
+      env:
+        WX_CONFIG: ${{ inputs.configuration }}
+        WX_PLATFORM: ${{ inputs.platform }}
+        WX_TOOLSET: ${{ inputs.toolset }}
+        WX_CXX_STD: ${{ inputs.cxx-standard }}
+        WX_PROJECTS: ${{ inputs.projects }}
+      run: |
+        # The C++ standard can only be changed by using wx_local.props, which
+        # is imported by all wx projects. It is also imported by wxwidgets.props
+        # however, so remove it after the build to avoid affecting the projects
+        # using wxWidgets: they must choose their C++ standard themselves.
+        if ($env:WX_CXX_STD) {
+          Set-Content -Path wx_local.props -Value @"
+        <?xml version="1.0" encoding="utf-8"?>
+        <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+          <ItemDefinitionGroup>
+            <ClCompile>
+              <LanguageStandard>stdcpp$env:WX_CXX_STD</LanguageStandard>
+            </ClCompile>
+          </ItemDefinitionGroup>
+        </Project>
+        "@
+        }
+
+        $props = "Configuration=$env:WX_CONFIG;Platform=$env:WX_PLATFORM"
+        if ($env:WX_TOOLSET) { $props += ";PlatformToolset=$env:WX_TOOLSET" }
+        $targets = if ($env:WX_PROJECTS) { "-target:$env:WX_PROJECTS" } else { "-target:Build" }
+        msbuild -noLogo -maxCpuCount -verbosity:m "-property:$props" $targets wx_vc17.sln
+        $status = $LASTEXITCODE
+
+        Remove-Item -Path wx_local.props -ErrorAction Ignore
+        exit $status
+
+    - name: Save wxWidgets to cache
+      if: steps.restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        key: ${{ steps.setup.outputs.key }}
+        path: ${{ steps.setup.outputs.paths }}

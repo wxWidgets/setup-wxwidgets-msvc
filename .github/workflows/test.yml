@@ -1,0 +1,98 @@
+name: Test
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+  # Run weekly to detect breakage due to the runner image changes.
+  schedule:
+    - cron: '23 4 * * 1'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: wx 3.3 x64 Release
+            ref: v3.3.4
+            configuration: Release
+            platform: x64
+          - name: wx 3.3 x64 Debug v143 C++20
+            ref: v3.3.4
+            configuration: Debug
+            platform: x64
+            toolset: v143
+            cxx-standard: 20
+          - name: wx 3.2 Win32 Release
+            ref: v3.2.12
+            configuration: Release
+            platform: Win32
+
+    steps:
+      - name: Check out the action
+        uses: actions/checkout@v7
+
+      - name: Set up wxWidgets
+        id: wx
+        uses: ./
+        with:
+          ref: ${{ matrix.ref }}
+          configuration: ${{ matrix.configuration }}
+          platform: ${{ matrix.platform }}
+          toolset: ${{ matrix.toolset }}
+          cxx-standard: ${{ matrix.cxx-standard }}
+          projects: core
+          # Always build wxWidgets instead of using the cache from the
+          # previous run, as this is what we want to test.
+          cache-version: ${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Build and run test program
+        uses: ./.github/actions/run-test
+        with:
+          configuration: ${{ matrix.configuration }}
+          platform: ${{ matrix.platform }}
+          toolset: ${{ matrix.toolset }}
+          cxx-standard: ${{ matrix.cxx-standard }}
+
+  cache:
+    name: Check using cached build
+    needs: build
+    runs-on: windows-2025
+
+    steps:
+      - name: Check out the action
+        uses: actions/checkout@v7
+
+      - name: Set up wxWidgets
+        id: wx
+        uses: ./
+        with:
+          ref: v3.3.4
+          configuration: Release
+          platform: x64
+          projects: core
+          cache-version: ${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Check that the cache was used
+        if: steps.wx.outputs.cache-hit != 'true'
+        run: |
+          echo "::error::wxWidgets was not restored from the cache."
+          exit 1
+
+      - name: Build and run test program
+        uses: ./.github/actions/run-test
+        with:
+          configuration: Release
+          platform: x64
